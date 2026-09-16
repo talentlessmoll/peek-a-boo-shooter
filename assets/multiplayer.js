@@ -34,13 +34,33 @@
     "=":{row:44,cols:[1,2,3]},"€":{row:45,cols:[1,2,3]}
   };
 
-  // Ultra-fast, highly reliable STUN servers (verified <500ms latency)
+  // High-availability ICE configuration (Google STUN + Cloudflare STUN + Twilio STUN + OpenRelay TURN + PeerJS TURN)
   const WEBRTC_CONFIG = {
     iceServers: [
-      { urls: 'stun:stun.cloudflare.com:3478' },
       { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' }
-    ]
+      { urls: 'stun:stun1.l.google.com:19302' },
+      { urls: 'stun:stun2.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      { urls: 'stun:global.stun.twilio.com:3478' },
+      {
+        urls: [
+          'turn:openrelay.metered.ca:80',
+          'turn:openrelay.metered.ca:443',
+          'turn:openrelay.metered.ca:443?transport=tcp'
+        ],
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+      },
+      {
+        urls: [
+          'turn:eu-0.turn.peerjs.com:3478',
+          'turn:us-0.turn.peerjs.com:3478'
+        ],
+        username: 'peerjs',
+        credential: 'peerjsp'
+      }
+    ],
+    iceCandidatePoolSize: 10
   };
 
   // Match Lifecycle States
@@ -333,6 +353,7 @@
       case 'ROUND_START':
         window.__MP_DISTANCE = data.distance;
         window.__MP_WEAPON_IDX = data.weaponIdx;
+        currentGameState = State.PLAYING;
         triggerGameNextRound();
         break;
 
@@ -388,7 +409,7 @@
       const res = await fetch('/api/signal/status', { method: 'GET' });
       if (res.ok) {
         const d = await res.json();
-        return d && d.status === 'ok';
+        return d && d.status === 'ok' && d.backend !== 'cloudflare-edge';
       }
     } catch (e) {}
     return false;
@@ -577,7 +598,8 @@
       });
       const data = await res.json();
       if (data.status !== 'ok') {
-        setStatus('COULD NOT CREATE ROOM');
+        console.warn('Native signal create not ok, falling back to peerjs:', data);
+        hostMatchPeerJS(code);
         return;
       }
     } catch (e) {
@@ -623,8 +645,8 @@
       });
       const data = await res.json();
       if (data.status !== 'ok') {
-        setStatus('ROOM ' + roomCode + ' NOT FOUND');
-        disableJoinControls(false);
+        console.warn('Native signal join not found, falling back to peerjs:', data);
+        joinMatchPeerJS(code);
         return;
       }
     } catch (e) {

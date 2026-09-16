@@ -1,14 +1,19 @@
 /**
- * Peek-a-Boo Shooter - WebRTC P2P Multiplayer Engine
- * 100% Client-Side JavaScript (0 Python required, runs natively on Cloudflare Pages)
- * Features pixel-perfect font rendering and retro aesthetics matching the original game.
+ * Peek-a-Boo Shooter - WebRTC P2P Multiplayer Engine (Enhanced & Resilient)
+ * 100% Client-Side JavaScript (Runs natively on Cloudflare Pages, GitHub Pages & local servers)
+ * Features pixel-perfect font rendering, multi-STUN/TURN NAT traversal, and reliable match syncing.
  */
 
 (function () {
   'use strict';
 
-  // Game's exact sprite pixel font mapping
-  const FONT_SPRITE_URL = '/assets/pixel_font_sprites_1785404885523-BNQ_ZQzH.png';
+  // Dynamic pixel font sprite URL supporting both domain root and subpaths
+  const FONT_SPRITE_URL = (function () {
+    const path = window.location.pathname;
+    const base = path.endsWith('/') ? path : path.substring(0, path.lastIndexOf('/') + 1);
+    return base + 'assets/pixel_font_sprites_1785404885523-BNQ_ZQzH.png';
+  })();
+
   const SS = 20;   // sprite unit size
   const SV = 140;  // sprite sheet width
   const RV = 920;  // sprite sheet height
@@ -29,7 +34,59 @@
     "=":{row:44,cols:[1,2,3]},"€":{row:45,cols:[1,2,3]}
   };
 
-  // State
+  // High-availability ICE configuration (Google STUN + Cloudflare STUN + Twilio STUN + OpenRelay TURN + PeerJS TURN)
+  const ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:global.stun.twilio.com:3478' },
+    {
+      urls: [
+        'turn:eu-0.turn.peerjs.com:3478',
+        'turn:us-0.turn.peerjs.com:3478'
+      ],
+      username: 'peerjs',
+      credential: 'peerjsp'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:80',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    },
+    {
+      urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+      username: 'openrelayproject',
+      credential: 'openrelayproject'
+    }
+  ];
+
+  const PEER_CONFIG = {
+    debug: 1,
+    config: {
+      iceServers: ICE_SERVERS,
+      iceCandidatePoolSize: 10
+    }
+  };
+
+  // Match Lifecycle States
+  const State = {
+    IDLE: 'IDLE',
+    HOST_LOBBY: 'HOST_LOBBY',
+    JOINING: 'JOINING',
+    GUEST_LOBBY: 'GUEST_LOBBY',
+    COUNTDOWN: 'COUNTDOWN',
+    PLAYING: 'PLAYING',
+    ROUND_OVER: 'ROUND_OVER',
+    MATCH_OVER: 'MATCH_OVER'
+  };
+
+  let currentGameState = State.IDLE;
   let peer = null;
   let conn = null;
   let isHost = false;
@@ -42,10 +99,10 @@
   let pingInterval = null;
   let lastPingTime = 0;
   let currentPing = 0;
-  let isMatchActive = false;
   let roundOverTimer = null;
+  let joinTimeoutTimer = null;
 
-  // Sound effects
+  // Sound effects synthesizer (Web Audio API)
   const AudioContext = window.AudioContext || window.webkitAudioContext;
   let audioCtx = null;
   function getAudioContext() {
@@ -89,7 +146,7 @@
     setTimeout(() => playTone(261.63, 0.28, 'sawtooth'), 260);
   }
 
-  // Create pixel font DOM element matching React's Ye component
+  // Create pixel font DOM element matching React Ye component
   function createPixelText(text, size = 16) {
     const container = document.createElement('span');
     container.className = 'mp-pixel-text';
@@ -139,7 +196,7 @@
       }
     }
 
-    // Animated jitter timer
+    // Animated jitter loop
     function updateFrames() {
       if (!container.isConnected) return;
       const now = Date.now();
@@ -157,7 +214,7 @@
     return container;
   }
 
-  // 4-letter room code generator
+  // 4-letter room code generator (excludes easily confused letters like I, O, 0, 1)
   function generateRoomCode() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     let code = '';
@@ -167,7 +224,13 @@
     return code;
   }
 
-  // Styles matching the game's exact black/white minimalist aesthetic
+  function getFormatLabel(wins) {
+    if (wins === 1) return '1 Round Sudden Death';
+    if (wins === 5) return 'First to 5 Wins (Best of 9)';
+    return 'First to 3 Wins (Best of 5)';
+  }
+
+  // Styles matching game exact minimalist aesthetic
   const style = document.createElement('style');
   style.textContent = `
     .mp-ui {
@@ -217,6 +280,10 @@
       background: #000000;
       color: #ffffff;
     }
+    .mp-btn-game:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
     .mp-btn-small {
       padding: 6px 12px;
       font-size: 13px;
@@ -226,6 +293,9 @@
       border: 2px solid #000000;
       border-radius: 6px;
       cursor: pointer;
+    }
+    .mp-btn-small:hover {
+      background: #f4f4f5;
     }
     .mp-input-game {
       font-size: 15px;
@@ -282,7 +352,7 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 20px;
+      gap: 18px;
       text-align: center;
       padding: 20px;
     }
@@ -325,13 +395,13 @@
   `;
   document.head.appendChild(style);
 
-  // Send packet
+  // Reliable packet transport
   function sendPacket(data) {
     if (conn && conn.open) {
       try {
         conn.send(data);
       } catch (e) {
-        console.error('Send error:', e);
+        console.warn('Packet send error:', e);
       }
     }
   }
@@ -378,31 +448,58 @@
 
       case 'HELLO':
         opponentName = data.name || 'Opponent';
-        onConnected();
+        if (data.targetWins) targetWins = data.targetWins;
+        if (isHost) {
+          onConnected();
+        } else {
+          renderGuestLobby();
+        }
+        break;
+
+      case 'FORMAT_CHANGE':
+        targetWins = data.targetWins || targetWins;
+        const fmtEl = document.getElementById('mp-guest-format');
+        if (fmtEl) fmtEl.textContent = getFormatLabel(targetWins);
         break;
 
       case 'START_COUNTDOWN':
         opponentName = data.hostName || opponentName;
-        targetWins = data.targetWins || 3;
+        targetWins = data.targetWins || targetWins;
         startCountdown();
         break;
 
       case 'ROUND_START':
         window.__MP_DISTANCE = data.distance;
         window.__MP_WEAPON_IDX = data.weaponIdx;
-        if (window.__MP_NEXT_ROUND) {
-          window.__MP_NEXT_ROUND();
-        }
+        triggerGameNextRound();
         break;
 
       case 'OPPONENT_SHOOT':
-        if (window.__MP_OPPONENT_SHOOT) {
-          window.__MP_OPPONENT_SHOOT();
+        handleOpponentShoot();
+        break;
+
+      case 'GUEST_ROUND_REPORT':
+        if (isHost && currentGameState === State.PLAYING) {
+          let hostPerspective = 'draw';
+          if (data.result === 'KO_WIN') hostPerspective = 'KO_LOSS';
+          else if (data.result === 'KO_LOSS') hostPerspective = 'KO_WIN';
+          else if (data.result === 'TIMEOUT_WIN') hostPerspective = 'TIMEOUT_LOSS';
+          else if (data.result === 'TIMEOUT_LOSS') hostPerspective = 'TIMEOUT_WIN';
+          handleHostRoundResult(hostPerspective);
         }
         break;
 
       case 'ROUND_RESULT':
-        handleRoundResultFromHost(data);
+        handleGuestRoundResultFromHost(data);
+        break;
+
+      case 'PLAY_AGAIN':
+        const ban = document.getElementById('mp-round-banner');
+        if (ban) ban.remove();
+        myWins = 0;
+        opponentWins = 0;
+        updateHudScore();
+        currentGameState = State.PLAYING;
         break;
 
       case 'REACTION':
@@ -410,124 +507,195 @@
         break;
 
       case 'LEAVE_MATCH':
-        handleOpponentLeft();
+        handleConnectionClosed();
         break;
     }
   }
 
   // Host room
   function hostMatch(code) {
-    roomCode = code.toUpperCase();
+    cleanupConnection();
+    roomCode = (code || generateRoomCode()).toUpperCase();
+    currentGameState = State.HOST_LOBBY;
+    isHost = true;
     setStatus('CREATING ROOM...');
 
-    if (peer) peer.destroy();
+    try {
+      peer = new Peer('pab-' + roomCode, PEER_CONFIG);
+    } catch (e) {
+      console.error('Peer init error:', e);
+      setStatus('FAILED TO INITIALIZE PEER');
+      return;
+    }
 
-    peer = new Peer('pab-' + roomCode, {
-      debug: 1,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:global.stun.twilio.com:3478' }
-        ]
-      }
-    });
-
-    peer.on('open', () => {
-      isHost = true;
+    peer.on('open', (id) => {
+      console.log('Host peer ready:', id);
       renderHostLobby();
     });
 
     peer.on('connection', (incoming) => {
+      console.log('Incoming connection from guest');
       conn = incoming;
-      setupConnection();
+      setupConnectionHandlers();
     });
 
     peer.on('error', (err) => {
+      console.warn('Peer error (host):', err);
       if (err.type === 'unavailable-id') {
         hostMatch(generateRoomCode());
       } else {
-        setStatus('ERROR: ' + err.message);
+        setStatus('NETWORK ERROR: ' + (err.type || err.message));
       }
     });
   }
 
   // Join room
   function joinMatch(code) {
+    cleanupConnection();
     roomCode = code.trim().toUpperCase();
     if (roomCode.length !== 4) {
       setStatus('ENTER 4-LETTER CODE');
       return;
     }
 
+    currentGameState = State.JOINING;
+    isHost = false;
     setStatus('CONNECTING TO ' + roomCode + '...');
+    disableJoinControls(true);
 
-    if (peer) peer.destroy();
+    try {
+      peer = new Peer(null, PEER_CONFIG);
+    } catch (e) {
+      console.error('Peer init error:', e);
+      setStatus('FAILED TO INITIALIZE PEER');
+      disableJoinControls(false);
+      return;
+    }
 
-    peer = new Peer({
-      debug: 1,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:global.stun.twilio.com:3478' }
-        ]
+    if (joinTimeoutTimer) clearTimeout(joinTimeoutTimer);
+    joinTimeoutTimer = setTimeout(() => {
+      if (currentGameState === State.JOINING) {
+        setStatus('CONNECTION TIMEOUT. CHECK CODE & RETRY.');
+        disableJoinControls(false);
+        cleanupConnection();
       }
-    });
+    }, 12000);
 
-    peer.on('open', () => {
-      isHost = false;
+    peer.on('open', (id) => {
+      console.log('Guest peer ready (' + id + '), connecting to pab-' + roomCode);
       conn = peer.connect('pab-' + roomCode, { reliable: true });
-      setupConnection();
+      setupConnectionHandlers();
     });
 
-    peer.on('error', () => {
-      setStatus('ROOM NOT FOUND');
+    peer.on('error', (err) => {
+      console.warn('Peer error (guest):', err);
+      clearTimeout(joinTimeoutTimer);
+      disableJoinControls(false);
+      if (err.type === 'peer-unavailable') {
+        setStatus('ROOM ' + roomCode + ' NOT FOUND');
+      } else {
+        setStatus('ERROR: ' + (err.type || 'COULD NOT CONNECT'));
+      }
     });
   }
 
-  function setupConnection() {
+  function setupConnectionHandlers() {
+    if (!conn) return;
+
     conn.on('open', () => {
+      console.log('DataChannel connected!');
+      clearTimeout(joinTimeoutTimer);
       playConnectSound();
       startPing();
 
       sendPacket({
         type: 'HELLO',
-        name: myPlayerName
+        name: myPlayerName,
+        targetWins: targetWins
       });
 
       if (isHost) {
+        currentGameState = State.HOST_LOBBY;
         onConnected();
+      } else {
+        currentGameState = State.GUEST_LOBBY;
+        renderGuestLobby();
       }
     });
 
     conn.on('data', handlePacket);
-    conn.on('close', handleOpponentLeft);
-    conn.on('error', handleOpponentLeft);
+
+    conn.on('close', () => {
+      console.log('DataChannel closed');
+      handleConnectionClosed();
+    });
+
+    conn.on('error', (err) => {
+      console.warn('DataChannel error:', err);
+      handleConnectionClosed();
+    });
   }
 
   function onConnected() {
-    const statusEl = document.getElementById('mp-status-text');
-    if (statusEl) {
-      statusEl.innerHTML = '';
-      statusEl.appendChild(createPixelText('CONNECTED TO ' + opponentName.toUpperCase(), 14));
-    }
-
-    if (isHost) {
-      const btn = document.getElementById('mp-start-btn');
-      if (btn) {
-        btn.style.display = 'flex';
-        btn.onclick = () => {
-          sendPacket({
-            type: 'START_COUNTDOWN',
-            hostName: myPlayerName,
-            targetWins: targetWins
-          });
-          startCountdown();
-        };
-      }
+    setStatus('CONNECTED TO ' + opponentName.toUpperCase());
+    const btn = document.getElementById('mp-start-btn');
+    if (btn) {
+      btn.style.display = 'flex';
     }
   }
 
+  function handleConnectionClosed() {
+    stopPing();
+
+    if (currentGameState === State.PLAYING || currentGameState === State.COUNTDOWN || currentGameState === State.ROUND_OVER) {
+      showDisconnectBanner();
+    } else if (currentGameState === State.GUEST_LOBBY) {
+      renderJoinTab(roomCode);
+      setStatus('HOST DISCONNECTED');
+    } else if (currentGameState === State.HOST_LOBBY) {
+      const startBtn = document.getElementById('mp-start-btn');
+      if (startBtn) startBtn.style.display = 'none';
+      setStatus('OPPONENT LEFT. WAITING FOR NEW PLAYER...');
+    } else if (currentGameState === State.JOINING) {
+      setStatus('COULD NOT CONNECT TO ROOM');
+      disableJoinControls(false);
+    }
+  }
+
+  function showDisconnectBanner() {
+    currentGameState = State.IDLE;
+    stopPing();
+    removeHud();
+
+    const oldBanner = document.getElementById('mp-round-banner');
+    if (oldBanner) oldBanner.remove();
+
+    const banner = document.createElement('div');
+    banner.className = 'mp-banner mp-ui';
+    banner.id = 'mp-disconnect-banner';
+
+    banner.appendChild(createPixelText('OPPONENT LEFT', 22));
+
+    const msg = document.createElement('p');
+    msg.style.fontSize = '14px';
+    msg.style.color = '#555';
+    msg.textContent = 'Your opponent disconnected from the match.';
+    banner.appendChild(msg);
+
+    const btn = document.createElement('button');
+    btn.className = 'mp-btn-game';
+    btn.appendChild(createPixelText('RETURN TO MENU', 16));
+    btn.onclick = () => {
+      banner.remove();
+      leaveMatch();
+    };
+    banner.appendChild(btn);
+
+    document.body.appendChild(banner);
+  }
+
   function startCountdown() {
+    currentGameState = State.COUNTDOWN;
     let count = 3;
     const box = document.querySelector('.mp-box');
     if (box) {
@@ -557,7 +725,7 @@
   }
 
   function launchGame() {
-    isMatchActive = true;
+    currentGameState = State.PLAYING;
     myWins = 0;
     opponentWins = 0;
     window.__MP_ACTIVE = true;
@@ -568,36 +736,14 @@
 
     window.__MP_ON_ROUND_END = (result) => {
       if (isHost) {
-        let winner = 'draw';
-        if (result === 'KO_WIN') {
-          winner = 'host';
-          myWins++;
-        } else if (result === 'KO_LOSS') {
-          winner = 'guest';
-          opponentWins++;
-        }
-
-        sendPacket({
-          type: 'ROUND_RESULT',
-          winner: winner,
-          hostWins: myWins,
-          guestWins: opponentWins
-        });
-
-        showResultBanner(winner === 'host', winner === 'draw');
+        handleHostRoundResult(result);
+      } else {
+        sendPacket({ type: 'GUEST_ROUND_REPORT', result: result });
       }
     };
 
     if (isHost) {
-      const weaponIdx = Math.floor(Math.random() * 4);
-      const distance = (150 + Math.random() * 300) / 500;
-      window.__MP_WEAPON_IDX = weaponIdx;
-      window.__MP_DISTANCE = distance;
-      sendPacket({
-        type: 'ROUND_START',
-        weaponIdx: weaponIdx,
-        distance: distance
-      });
+      prepareAndSendNextRound();
     }
 
     if (window.__PAB && window.__PAB.startMultiplayer) {
@@ -608,18 +754,100 @@
     createReactions();
   }
 
-  function handleRoundResultFromHost(data) {
-    if (!isMatchActive) return;
-    const winner = data.winner;
-    myWins = data.guestWins;
-    opponentWins = data.hostWins;
-    showResultBanner(winner === 'guest', winner === 'draw');
+  function prepareAndSendNextRound() {
+    const weaponIdx = Math.floor(Math.random() * 4);
+    const distance = (150 + Math.random() * 300) / 500;
+    window.__MP_WEAPON_IDX = weaponIdx;
+    window.__MP_DISTANCE = distance;
+    sendPacket({
+      type: 'ROUND_START',
+      weaponIdx: weaponIdx,
+      distance: distance
+    });
+    triggerGameNextRound();
   }
 
-  function showResultBanner(isMeWinner, isDraw) {
+  function triggerGameNextRound() {
+    const banner = document.getElementById('mp-round-banner');
+    if (banner) banner.remove();
+
+    if (window.__MP_NEXT_ROUND) {
+      window.__MP_NEXT_ROUND();
+    } else {
+      let attempts = 0;
+      const interval = setInterval(() => {
+        attempts++;
+        if (window.__MP_NEXT_ROUND) {
+          clearInterval(interval);
+          window.__MP_NEXT_ROUND();
+        } else if (attempts > 20) {
+          clearInterval(interval);
+        }
+      }, 50);
+    }
+  }
+
+  function handleOpponentShoot() {
+    const pe = window.__PEEK_ENGINE;
+    const opp = pe && pe.ut;
+    if (opp && opp.state === 'SIT' && opp.canPerformAction()) {
+      opp.startShoot();
+      return;
+    }
+    let retries = 0;
+    const interval = setInterval(() => {
+      retries++;
+      const currentOpp = window.__PEEK_ENGINE && window.__PEEK_ENGINE.ut;
+      if (currentOpp && currentOpp.state === 'SIT' && currentOpp.canPerformAction()) {
+        clearInterval(interval);
+        currentOpp.startShoot();
+      } else if (retries > 8) {
+        clearInterval(interval);
+        if (window.__MP_OPPONENT_SHOOT) window.__MP_OPPONENT_SHOOT();
+      }
+    }, 25);
+  }
+
+  function handleHostRoundResult(result) {
+    if (currentGameState !== State.PLAYING) return;
+    currentGameState = State.ROUND_OVER;
+
+    let winner = 'draw';
+    if (result === 'KO_WIN' || result === 'TIMEOUT_WIN') {
+      winner = 'host';
+      myWins++;
+    } else if (result === 'KO_LOSS' || result === 'TIMEOUT_LOSS') {
+      winner = 'guest';
+      opponentWins++;
+    }
+
+    sendPacket({
+      type: 'ROUND_RESULT',
+      winner: winner,
+      hostWins: myWins,
+      guestWins: opponentWins,
+      targetWins: targetWins,
+      reason: result
+    });
+
+    showResultBanner(winner === 'host', winner === 'draw', result);
+  }
+
+  function handleGuestRoundResultFromHost(data) {
+    currentGameState = State.ROUND_OVER;
+    myWins = data.guestWins;
+    opponentWins = data.hostWins;
+    targetWins = data.targetWins || targetWins;
+    showResultBanner(data.winner === 'guest', data.winner === 'draw', data.reason);
+  }
+
+  function showResultBanner(isMeWinner, isDraw, reason) {
     updateHudScore();
     if (isMeWinner) playWinSound();
     else if (!isDraw) playLoseSound();
+
+    const existing = document.getElementById('mp-round-banner');
+    if (existing) existing.remove();
 
     const banner = document.createElement('div');
     banner.className = 'mp-banner mp-ui';
@@ -629,35 +857,52 @@
     const isMatchWinner = myWins >= targetWins;
 
     if (matchOver) {
-      banner.appendChild(createPixelText(isMatchWinner ? 'MATCH VICTORY!' : 'DEFEAT!', 24));
+      currentGameState = State.MATCH_OVER;
+      banner.appendChild(createPixelText(isMatchWinner ? 'MATCH VICTORY!' : 'MATCH DEFEAT!', 24));
       const scoreTxt = document.createElement('div');
-      scoreTxt.style.fontSize = '14px';
-      scoreTxt.style.color = '#555';
+      scoreTxt.style.fontSize = '15px';
+      scoreTxt.style.color = '#333';
+      scoreTxt.style.margin = '10px 0';
       scoreTxt.textContent = `FINAL SCORE: ${myWins} - ${opponentWins}`;
       banner.appendChild(scoreTxt);
 
-      const againBtn = document.createElement('button');
-      againBtn.className = 'mp-btn-game';
-      againBtn.appendChild(createPixelText('PLAY AGAIN', 16));
-      againBtn.onclick = () => {
-        banner.remove();
-        myWins = 0;
-        opponentWins = 0;
-        updateHudScore();
-        if (isHost) nextRoundHost();
-      };
-      banner.appendChild(againBtn);
+      if (isHost) {
+        const againBtn = document.createElement('button');
+        againBtn.className = 'mp-btn-game';
+        againBtn.appendChild(createPixelText('PLAY AGAIN', 16));
+        againBtn.onclick = () => {
+          banner.remove();
+          myWins = 0;
+          opponentWins = 0;
+          updateHudScore();
+          currentGameState = State.PLAYING;
+          sendPacket({ type: 'PLAY_AGAIN', targetWins: targetWins });
+          prepareAndSendNextRound();
+        };
+        banner.appendChild(againBtn);
+      } else {
+        const waitAgainTxt = document.createElement('div');
+        waitAgainTxt.style.fontSize = '13px';
+        waitAgainTxt.style.color = '#666';
+        waitAgainTxt.textContent = 'Waiting for host to restart match...';
+        banner.appendChild(waitAgainTxt);
+      }
 
       const exitBtn = document.createElement('button');
       exitBtn.className = 'mp-btn-game';
+      exitBtn.style.marginTop = '8px';
       exitBtn.appendChild(createPixelText('EXIT TO MENU', 16));
       exitBtn.onclick = () => {
         banner.remove();
+        sendPacket({ type: 'LEAVE_MATCH' });
         leaveMatch();
       };
       banner.appendChild(exitBtn);
     } else {
-      banner.appendChild(createPixelText(isDraw ? 'ROUND DRAW!' : (isMeWinner ? 'ROUND WON!' : 'ROUND LOST!'), 22));
+      let title = 'ROUND DRAW!';
+      if (!isDraw) title = isMeWinner ? 'ROUND WON!' : 'ROUND LOST!';
+      banner.appendChild(createPixelText(title, 22));
+
       const scoreTxt = document.createElement('div');
       scoreTxt.style.fontSize = '14px';
       scoreTxt.style.color = '#555';
@@ -677,26 +922,15 @@
         timerTxt.textContent = `Next round in ${timeLeft}s...`;
         if (timeLeft <= 0) {
           clearInterval(roundOverTimer);
-          banner.remove();
-          if (isHost) nextRoundHost();
+          if (isHost) {
+            currentGameState = State.PLAYING;
+            prepareAndSendNextRound();
+          }
         }
       }, 1000);
     }
 
     document.body.appendChild(banner);
-  }
-
-  function nextRoundHost() {
-    const weaponIdx = Math.floor(Math.random() * 4);
-    const distance = (150 + Math.random() * 300) / 500;
-    window.__MP_WEAPON_IDX = weaponIdx;
-    window.__MP_DISTANCE = distance;
-    sendPacket({
-      type: 'ROUND_START',
-      weaponIdx: weaponIdx,
-      distance: distance
-    });
-    if (window.__MP_NEXT_ROUND) window.__MP_NEXT_ROUND();
   }
 
   function createHud() {
@@ -778,25 +1012,35 @@
     document.body.appendChild(bar);
   }
 
-  function handleOpponentLeft() {
-    if (!isMatchActive && !document.querySelector('.mp-overlay')) return;
-    isMatchActive = false;
+  function cleanupConnection() {
     stopPing();
-    alert('Opponent disconnected.');
-    leaveMatch();
+    if (joinTimeoutTimer) {
+      clearTimeout(joinTimeoutTimer);
+      joinTimeoutTimer = null;
+    }
+    if (roundOverTimer) {
+      clearInterval(roundOverTimer);
+      roundOverTimer = null;
+    }
+    if (conn) {
+      try { conn.close(); } catch (e) {}
+      conn = null;
+    }
+    if (peer) {
+      try { peer.destroy(); } catch (e) {}
+      peer = null;
+    }
   }
 
   function leaveMatch() {
-    isMatchActive = false;
-    stopPing();
+    cleanupConnection();
+    currentGameState = State.IDLE;
     removeHud();
+
     const banner = document.getElementById('mp-round-banner');
     if (banner) banner.remove();
-
-    if (conn) conn.close();
-    if (peer) peer.destroy();
-    conn = null;
-    peer = null;
+    const discBanner = document.getElementById('mp-disconnect-banner');
+    if (discBanner) discBanner.remove();
 
     window.__MP_ACTIVE = false;
     if (window.__PAB && window.__PAB.exitToTitle) {
@@ -807,6 +1051,8 @@
   // Modal UI
   function openModal(defaultTab = 'host') {
     closeModal();
+    cleanupConnection();
+    currentGameState = State.IDLE;
     myPlayerName = localStorage.getItem('peekaboo-player-name') || myPlayerName;
 
     const overlay = document.createElement('div');
@@ -890,12 +1136,14 @@
     hostTabBtn.onclick = () => {
       hostTabBtn.classList.add('active');
       joinTabBtn.classList.remove('active');
+      cleanupConnection();
       renderHostTab();
     };
 
     joinTabBtn.onclick = () => {
       joinTabBtn.classList.add('active');
       hostTabBtn.classList.remove('active');
+      cleanupConnection();
       renderJoinTab();
     };
 
@@ -909,6 +1157,13 @@
       el.innerHTML = '';
       el.appendChild(createPixelText(text, 13));
     }
+  }
+
+  function disableJoinControls(disabled) {
+    const input = document.getElementById('mp-join-input');
+    const btn = document.getElementById('mp-join-btn');
+    if (input) input.disabled = disabled;
+    if (btn) btn.disabled = disabled;
   }
 
   function renderHostTab() {
@@ -928,15 +1183,19 @@
     formatRow.style.fontSize = '13px';
     formatRow.style.color = '#555';
     formatRow.innerHTML = `Format: <select id="mp-target-select" style="padding: 3px 6px; font-weight: bold; border: 2px solid #000; border-radius: 4px; background: white;">
-      <option value="3" selected>First to 3 Wins</option>
-      <option value="5">First to 5 Wins</option>
-      <option value="1">1 Round Duel</option>
+      <option value="3" ${targetWins === 3 ? 'selected' : ''}>First to 3 Wins</option>
+      <option value="5" ${targetWins === 5 ? 'selected' : ''}>First to 5 Wins</option>
+      <option value="1" ${targetWins === 1 ? 'selected' : ''}>1 Round Duel</option>
     </select>`;
     content.appendChild(formatRow);
 
-    document.getElementById('mp-target-select').onchange = (e) => {
-      targetWins = parseInt(e.target.value, 10);
-    };
+    const sel = document.getElementById('mp-target-select');
+    if (sel) {
+      sel.onchange = (e) => {
+        targetWins = parseInt(e.target.value, 10);
+      };
+    }
+    setStatus('READY TO HOST');
   }
 
   function renderHostLobby() {
@@ -948,7 +1207,7 @@
     roomBox.style.border = '2px dashed #000';
     roomBox.style.borderRadius = '6px';
     roomBox.style.padding = '10px';
-    roomBox.style.width = '80%';
+    roomBox.style.width = '85%';
     roomBox.style.background = '#fafafa';
 
     const label = document.createElement('div');
@@ -973,7 +1232,7 @@
     copyCodeBtn.textContent = 'Copy Code';
     copyCodeBtn.onclick = () => {
       navigator.clipboard.writeText(roomCode);
-      alert('Copied room code: ' + roomCode);
+      setStatus('COPIED CODE ' + roomCode);
     };
 
     const copyLinkBtn = document.createElement('button');
@@ -982,21 +1241,51 @@
     copyLinkBtn.onclick = () => {
       const url = window.location.origin + window.location.pathname + '?room=' + roomCode;
       navigator.clipboard.writeText(url);
-      alert('Copied invite link: ' + url);
+      setStatus('COPIED INVITE LINK!');
     };
 
     btnRow.appendChild(copyCodeBtn);
     btnRow.appendChild(copyLinkBtn);
     content.appendChild(btnRow);
 
-    setStatus('WAITING FOR OPPONENT...');
+    const formatRow = document.createElement('div');
+    formatRow.style.fontSize = '13px';
+    formatRow.style.color = '#555';
+    formatRow.innerHTML = `Format: <select id="mp-target-select" style="padding: 3px 6px; font-weight: bold; border: 2px solid #000; border-radius: 4px; background: white;">
+      <option value="3" ${targetWins === 3 ? 'selected' : ''}>First to 3 Wins</option>
+      <option value="5" ${targetWins === 5 ? 'selected' : ''}>First to 5 Wins</option>
+      <option value="1" ${targetWins === 1 ? 'selected' : ''}>1 Round Duel</option>
+    </select>`;
+    content.appendChild(formatRow);
+
+    const sel = document.getElementById('mp-target-select');
+    if (sel) {
+      sel.onchange = (e) => {
+        targetWins = parseInt(e.target.value, 10);
+        sendPacket({ type: 'FORMAT_CHANGE', targetWins: targetWins });
+      };
+    }
 
     const startBtn = document.createElement('button');
     startBtn.id = 'mp-start-btn';
     startBtn.className = 'mp-btn-game';
-    startBtn.style.display = 'none';
+    startBtn.style.display = conn && conn.open ? 'flex' : 'none';
     startBtn.appendChild(createPixelText('START MATCH ▶', 15));
+    startBtn.onclick = () => {
+      sendPacket({
+        type: 'START_COUNTDOWN',
+        hostName: myPlayerName,
+        targetWins: targetWins
+      });
+      startCountdown();
+    };
     content.appendChild(startBtn);
+
+    if (conn && conn.open) {
+      setStatus('OPPONENT READY: ' + opponentName.toUpperCase());
+    } else {
+      setStatus('WAITING FOR OPPONENT...');
+    }
   }
 
   function renderJoinTab(prefill = '') {
@@ -1005,6 +1294,7 @@
     content.innerHTML = '';
 
     const input = document.createElement('input');
+    input.id = 'mp-join-input';
     input.className = 'mp-input-game';
     input.placeholder = 'CODE';
     input.maxLength = 4;
@@ -1012,6 +1302,7 @@
     content.appendChild(input);
 
     const joinBtn = document.createElement('button');
+    joinBtn.id = 'mp-join-btn';
     joinBtn.className = 'mp-btn-game';
     joinBtn.appendChild(createPixelText('JOIN MATCH', 15));
     joinBtn.onclick = () => joinMatch(input.value);
@@ -1021,9 +1312,63 @@
       if (e.key === 'Enter') joinBtn.click();
     };
 
+    setStatus('ENTER 4-LETTER CODE');
+
     if (prefill && prefill.length === 4) {
-      setTimeout(() => joinBtn.click(), 200);
+      setTimeout(() => joinBtn.click(), 250);
     }
+  }
+
+  function renderGuestLobby() {
+    const content = document.getElementById('mp-tab-content');
+    if (!content) return;
+    content.innerHTML = '';
+
+    const box = document.createElement('div');
+    box.style.border = '2px solid #000';
+    box.style.borderRadius = '8px';
+    box.style.padding = '12px';
+    box.style.width = '85%';
+    box.style.background = '#fafafa';
+    box.style.display = 'flex';
+    box.style.flexDirection = 'column';
+    box.style.alignItems = 'center';
+    box.style.gap = '6px';
+
+    const roomLabel = document.createElement('div');
+    roomLabel.style.fontSize = '12px';
+    roomLabel.style.color = '#777';
+    roomLabel.textContent = 'ROOM ' + roomCode;
+    box.appendChild(roomLabel);
+
+    const hostLabel = document.createElement('div');
+    hostLabel.appendChild(createPixelText('HOST: ' + opponentName.toUpperCase(), 15));
+    box.appendChild(hostLabel);
+
+    const formatTxt = document.createElement('div');
+    formatTxt.id = 'mp-guest-format';
+    formatTxt.style.fontSize = '13px';
+    formatTxt.style.color = '#444';
+    formatTxt.textContent = getFormatLabel(targetWins);
+    box.appendChild(formatTxt);
+
+    content.appendChild(box);
+
+    const waitTxt = document.createElement('div');
+    waitTxt.style.margin = '8px 0';
+    waitTxt.appendChild(createPixelText('WAITING FOR HOST...', 13));
+    content.appendChild(waitTxt);
+
+    const leaveBtn = document.createElement('button');
+    leaveBtn.className = 'mp-btn-small';
+    leaveBtn.textContent = 'Leave Room';
+    leaveBtn.onclick = () => {
+      cleanupConnection();
+      renderJoinTab();
+    };
+    content.appendChild(leaveBtn);
+
+    setStatus('CONNECTED & READY!');
   }
 
   function closeModal() {

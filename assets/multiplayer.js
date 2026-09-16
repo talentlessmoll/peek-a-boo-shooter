@@ -61,6 +61,10 @@
   let dataChannel = null;       // RTCDataChannel (native or peerjs)
   let peerInstance = null;      // PeerJS instance (fallback)
   let pollInterval = null;      // Native signal polling
+  let pendingRemoteCandidates = []; // Candidate buffer for early arriving candidates
+  let packetCounter = 0;
+  let processedPacketIds = new Set();
+  let opponentConnected = false;
   let isHost = false;
   let roomCode = null;
   let myPlayerName = localStorage.getItem('peekaboo-player-name') || 'Player_' + Math.floor(1000 + Math.random() * 9000);
@@ -226,27 +230,38 @@
   `;
   document.head.appendChild(style);
 
-  // Send packet across active DataChannel
+  // Send packet across active DataChannel or instant HTTP relay
   function sendPacket(data) {
+    if (!data) return;
+    if (typeof data === 'object' && !data._pid) {
+      data._pid = (isHost ? 'h_' : 'g_') + (++packetCounter) + '_' + Date.now();
+    }
+    const payload = typeof data === 'string' ? data : JSON.stringify(data);
+
+    let sentViaDataChannel = false;
     if (dataChannel && (dataChannel.readyState === 'open' || dataChannel.open)) {
       try {
         if (typeof dataChannel.send === 'function') {
-          // Both native RTCDataChannel and PeerJS DataConnection support send()
-          dataChannel.send(typeof data === 'string' ? data : JSON.stringify(data));
+          dataChannel.send(payload);
+          sentViaDataChannel = true;
         }
       } catch (e) {
         console.warn('Packet send error:', e);
       }
+    }
+
+    // Fast-relay fallback: If DataChannel is not open, send via HTTP signal backend
+    if (!sentViaDataChannel && activeBackend === 'native' && roomCode) {
+      const targetRole = isHost ? 'guest' : 'host';
+      postSignal({ room: roomCode, target: targetRole, message: data });
     }
   }
 
   function startPing() {
     stopPing();
     pingInterval = setInterval(() => {
-      if (dataChannel && (dataChannel.readyState === 'open' || dataChannel.open)) {
-        lastPingTime = performance.now();
-        sendPacket({ type: 'PING', t: lastPingTime });
-      }
+      lastPingTime = performance.now();
+      sendPacket({ type: 'PING', t: lastPingTime });
     }, 2000);
   }
 
@@ -272,6 +287,16 @@
     }
     if (!data || !data.type) return;
 
+    // Deduplicate packets arriving via DataChannel and HTTP relay
+    if (data._pid) {
+      if (processedPacketIds.has(data._pid)) return;
+      processedPacketIds.add(data._pid);
+      if (processedPacketIds.size > 200) {
+        const first = processedPacketIds.values().next().value;
+        processedPacketIds.delete(first);
+      }
+    }
+
     switch (data.type) {
       case 'PING':
         sendPacket({ type: 'PONG', t: data.t });
@@ -284,6 +309,7 @@
 
       case 'HELLO':
         opponentName = data.name || 'Opponent';
+        opponentConnected = true;
         if (data.targetWins) targetWins = data.targetWins;
         if (isHost) {
           onConnected();
@@ -348,8 +374,16 @@
     }
   }
 
-  // Check if native /api/signal is supported by backend
+  function isLocalServer() {
+    return window.location.hostname === 'localhost' ||
+           window.location.hostname === '127.0.0.1' ||
+           window.location.hostname.startsWith('192.168.') ||
+           window.location.hostname.startsWith('10.') ||
+           window.location.hostname.endsWith('.local');
+  }
+
   async function hasNativeSignalBackend() {
+    if (isLocalServer()) return true;
     try {
       const res = await fetch('/api/signal/status', { method: 'GET' });
       if (res.ok) {
@@ -363,6 +397,31 @@
   // ==========================================
   // NATIVE WEBRTC SIGNALING (INSTANT / ZERO CLOUD)
   // ==========================================
+
+  async function addCandidateSafe(candidate) {
+    if (!candidate) return;
+    if (pc && pc.remoteDescription && pc.remoteDescription.type) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } catch (e) {
+        console.warn('addIceCandidate error:', e);
+      }
+    } else {
+      pendingRemoteCandidates.push(candidate);
+    }
+  }
+
+  async function flushPendingCandidates() {
+    if (!pc || !pc.remoteDescription) return;
+    for (const cand of pendingRemoteCandidates) {
+      try {
+        await pc.addIceCandidate(new RTCIceCandidate(cand));
+      } catch (e) {
+        console.warn('flush candidate error:', e);
+      }
+    }
+    pendingRemoteCandidates = [];
+  }
 
   async function postSignal(body) {
     try {
@@ -390,7 +449,7 @@
           }
         }
       } catch (e) {}
-    }, 350);
+    }, 75);
   }
 
   function stopSignalPolling() {
@@ -401,53 +460,72 @@
   }
 
   async function handleNativeSignalMessage(msg, role) {
-    if (!msg || !pc) return;
+    if (!msg) return;
 
     if (role === 'host') {
       if (msg.type === 'GUEST_JOINED') {
-        setStatus('GUEST CONNECTING... EXCHANGING KEYS');
-        try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          await postSignal({ room: roomCode, target: 'guest', message: { type: 'OFFER', sdp: offer } });
-        } catch (e) {
-          console.error('Host createOffer error:', e);
+        setStatus('OPPONENT JOINED!');
+        opponentConnected = true;
+        if (currentGameState === State.HOST_LOBBY) {
+          onConnected();
         }
+        sendPacket({
+          type: 'HELLO',
+          name: myPlayerName,
+          targetWins: targetWins
+        });
+        if (pc) {
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            await postSignal({ room: roomCode, target: 'guest', message: { type: 'OFFER', sdp: offer } });
+          } catch (e) {
+            console.warn('Host createOffer error:', e);
+          }
+        }
+        return;
       } else if (msg.type === 'ANSWER') {
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-        } catch (e) {
-          console.error('Host setRemoteDescription error:', e);
+        if (pc) {
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+            await flushPendingCandidates();
+          } catch (e) {
+            console.warn('Host setRemoteDescription error:', e);
+          }
         }
+        return;
       } else if (msg.type === 'CANDIDATE') {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-        } catch (e) {}
+        await addCandidateSafe(msg.candidate);
+        return;
       }
     } else if (role === 'guest') {
       if (msg.type === 'OFFER') {
-        setStatus('RECEIVED HOST OFFER. ANSWERING...');
-        try {
-          await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          await postSignal({ room: roomCode, target: 'host', message: { type: 'ANSWER', sdp: answer } });
-        } catch (e) {
-          console.error('Guest createAnswer error:', e);
+        if (pc) {
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+            await flushPendingCandidates();
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            await postSignal({ room: roomCode, target: 'host', message: { type: 'ANSWER', sdp: answer } });
+          } catch (e) {
+            console.warn('Guest createAnswer error:', e);
+          }
         }
+        return;
       } else if (msg.type === 'CANDIDATE') {
-        try {
-          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-        } catch (e) {}
+        await addCandidateSafe(msg.candidate);
+        return;
       }
     }
+
+    // Any other message is a game packet (HELLO, START_COUNTDOWN, ROUND_START, OPPONENT_SHOOT, etc.)
+    handlePacket(msg);
   }
 
   function setupNativeDataChannel(channel) {
     dataChannel = channel;
     channel.onopen = () => {
-      console.log('Native WebRTC DataChannel OPEN!');
-      stopSignalPolling();
+      console.log('WebRTC P2P DataChannel OPEN! High-speed channel active.');
       if (joinTimeoutTimer) clearTimeout(joinTimeoutTimer);
       playConnectSound();
       startPing();
@@ -468,8 +546,18 @@
     };
 
     channel.onmessage = (e) => handlePacket(e.data);
-    channel.onclose = () => handleConnectionClosed();
-    channel.onerror = () => handleConnectionClosed();
+    channel.onclose = () => {
+      console.log('DataChannel closed');
+      if (activeBackend !== 'native') {
+        handleConnectionClosed();
+      }
+    };
+    channel.onerror = (e) => {
+      console.warn('DataChannel error:', e);
+      if (activeBackend !== 'native') {
+        handleConnectionClosed();
+      }
+    };
   }
 
   async function hostMatchNative(code) {
@@ -477,6 +565,8 @@
     roomCode = code;
     isHost = true;
     currentGameState = State.HOST_LOBBY;
+    pendingRemoteCandidates = [];
+    opponentConnected = false;
     setStatus('CREATING ROOM...');
 
     try {
@@ -496,6 +586,10 @@
       return;
     }
 
+    renderHostLobby();
+    startSignalPolling('host');
+
+    // Opportunistic WebRTC P2P (fast lane)
     try {
       pc = new RTCPeerConnection(WEBRTC_CONFIG);
       const dc = pc.createDataChannel('game', { ordered: true });
@@ -506,12 +600,8 @@
           postSignal({ room: roomCode, target: 'guest', message: { type: 'CANDIDATE', candidate: e.candidate } });
         }
       };
-
-      renderHostLobby();
-      startSignalPolling('host');
     } catch (e) {
-      console.error('RTCPeerConnection init error:', e);
-      hostMatchPeerJS(code);
+      console.warn('RTCPeerConnection init notice (HTTP relay ready):', e);
     }
   }
 
@@ -519,8 +609,10 @@
     activeBackend = 'native';
     roomCode = code;
     isHost = false;
-    currentGameState = State.JOINING;
-    setStatus('LOOKING UP ROOM ' + roomCode + '...');
+    currentGameState = State.GUEST_LOBBY;
+    pendingRemoteCandidates = [];
+    opponentConnected = true;
+    setStatus('CONNECTING TO ROOM ' + roomCode + '...');
     disableJoinControls(true);
 
     try {
@@ -541,6 +633,19 @@
       return;
     }
 
+    // Room joined successfully!
+    startSignalPolling('guest');
+    renderGuestLobby();
+    playConnectSound();
+    startPing();
+
+    sendPacket({
+      type: 'HELLO',
+      name: myPlayerName,
+      targetWins: targetWins
+    });
+
+    // Opportunistic WebRTC P2P (fast lane)
     try {
       pc = new RTCPeerConnection(WEBRTC_CONFIG);
       pc.ondatachannel = (e) => {
@@ -552,21 +657,8 @@
           postSignal({ room: roomCode, target: 'host', message: { type: 'CANDIDATE', candidate: e.candidate } });
         }
       };
-
-      startSignalPolling('guest');
-      setStatus('CONNECTED TO ROOM! WAITING FOR HOST...');
-
-      if (joinTimeoutTimer) clearTimeout(joinTimeoutTimer);
-      joinTimeoutTimer = setTimeout(() => {
-        if (currentGameState === State.JOINING) {
-          setStatus('CONNECTION TIMEOUT. PLEASE RETRY.');
-          disableJoinControls(false);
-          cleanupConnection();
-        }
-      }, 15000);
     } catch (e) {
-      console.error('Guest RTCPeerConnection error:', e);
-      joinMatchPeerJS(code);
+      console.warn('Guest RTCPeerConnection notice (HTTP relay ready):', e);
     }
   }
 
@@ -714,6 +806,7 @@
   // ==========================================
 
   function onConnected() {
+    opponentConnected = true;
     setStatus('CONNECTED TO ' + opponentName.toUpperCase());
     const btn = document.getElementById('mp-start-btn');
     if (btn) {
@@ -724,6 +817,7 @@
   function handleConnectionClosed() {
     stopPing();
     stopSignalPolling();
+    opponentConnected = false;
 
     if (currentGameState === State.PLAYING || currentGameState === State.COUNTDOWN || currentGameState === State.ROUND_OVER) {
       showDisconnectBanner();
@@ -735,9 +829,10 @@
       if (startBtn) startBtn.style.display = 'none';
       setStatus('OPPONENT LEFT. WAITING FOR NEW PLAYER...');
     } else if (currentGameState === State.JOINING) {
-      setStatus('COULD NOT CONNECT TO ROOM');
       disableJoinControls(false);
+      setStatus('CONNECTION CLOSED');
     }
+    currentGameState = State.IDLE;
   }
 
   function showDisconnectBanner() {
@@ -1093,6 +1188,8 @@
   function cleanupConnection() {
     stopPing();
     stopSignalPolling();
+    pendingRemoteCandidates = [];
+    opponentConnected = false;
 
     if (joinTimeoutTimer) {
       clearTimeout(joinTimeoutTimer);
@@ -1349,7 +1446,7 @@
     const startBtn = document.createElement('button');
     startBtn.id = 'mp-start-btn';
     startBtn.className = 'mp-btn-game';
-    startBtn.style.display = dataChannel && (dataChannel.readyState === 'open' || dataChannel.open) ? 'flex' : 'none';
+    startBtn.style.display = (opponentConnected || (dataChannel && (dataChannel.readyState === 'open' || dataChannel.open))) ? 'flex' : 'none';
     startBtn.appendChild(createPixelText('START MATCH ▶', 15));
     startBtn.onclick = () => {
       sendPacket({
@@ -1361,7 +1458,7 @@
     };
     content.appendChild(startBtn);
 
-    if (dataChannel && (dataChannel.readyState === 'open' || dataChannel.open)) {
+    if (opponentConnected || (dataChannel && (dataChannel.readyState === 'open' || dataChannel.open))) {
       setStatus('OPPONENT READY: ' + opponentName.toUpperCase());
     } else {
       setStatus('WAITING FOR OPPONENT...');

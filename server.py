@@ -1,6 +1,6 @@
-#!/usr/bin/env python3
 import http.server
 import socketserver
+import threading
 import json
 import os
 import sys
@@ -13,24 +13,35 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LEADERBOARD_FILE = os.path.join(BASE_DIR, "leaderboard.json")
 
-# In-memory WebRTC signaling rooms:
+# In-memory WebRTC signaling & message relay rooms:
 # room_code -> { "created": timestamp, "host_msgs": [], "guest_msgs": [] }
 ROOMS = {}
+ROOMS_LOCK = threading.Lock()
 
 def clean_old_rooms():
     now = time.time()
-    for code in list(ROOMS.keys()):
-        if now - ROOMS[code].get("created", 0) > 3600:
-            ROOMS.pop(code, None)
+    with ROOMS_LOCK:
+        for code in list(ROOMS.keys()):
+            if now - ROOMS[code].get("created", 0) > 3600:
+                ROOMS.pop(code, None)
 
 class CustomHandler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=BASE_DIR, **kwargs)
 
+    def log_message(self, format, *args):
+        # Suppress spammy polling logs, but log all room events and regular requests
+        if args and any("/api/signal/poll" in str(a) for a in args):
+            return
+        super().log_message(format, *args)
+
     def end_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
         super().end_headers()
 
     def do_OPTIONS(self):
@@ -71,13 +82,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
 
-            if room in ROOMS:
-                key = "host_msgs" if role == "host" else "guest_msgs"
-                msgs = list(ROOMS[room].get(key, []))
-                ROOMS[room][key] = []
-                self.wfile.write(json.dumps({"status": "ok", "messages": msgs}).encode("utf-8"))
-            else:
-                self.wfile.write(b'{"status":"error","error":"ROOM_NOT_FOUND","messages":[]}')
+            with ROOMS_LOCK:
+                if room in ROOMS:
+                    key = "host_msgs" if role == "host" else "guest_msgs"
+                    msgs = list(ROOMS[room].get(key, []))
+                    ROOMS[room][key] = []
+                    self.wfile.write(json.dumps({"status": "ok", "messages": msgs}).encode("utf-8"))
+                else:
+                    self.wfile.write(b'{"status":"error","error":"ROOM_NOT_FOUND","messages":[]}')
             return
 
         # Fallback to SPA index.html for unknown HTML paths
@@ -97,11 +109,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 data = json.loads(body.decode("utf-8")) if body else {}
                 room = data.get("room", "").upper()
                 clean_old_rooms()
-                ROOMS[room] = {
-                    "created": time.time(),
-                    "host_msgs": [],
-                    "guest_msgs": []
-                }
+                with ROOMS_LOCK:
+                    ROOMS[room] = {
+                        "created": time.time(),
+                        "host_msgs": [],
+                        "guest_msgs": []
+                    }
+                print(f"[ROOM CREATED] {room}")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -124,11 +138,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
 
-                if room in ROOMS:
-                    ROOMS[room]["host_msgs"].append({"type": "GUEST_JOINED"})
-                    self.wfile.write(json.dumps({"status": "ok", "room": room}).encode("utf-8"))
-                else:
-                    self.wfile.write(json.dumps({"status": "error", "error": "ROOM_NOT_FOUND"}).encode("utf-8"))
+                with ROOMS_LOCK:
+                    if room in ROOMS:
+                        ROOMS[room]["host_msgs"].append({"type": "GUEST_JOINED"})
+                        print(f"[ROOM JOINED] Guest joined room {room}")
+                        self.wfile.write(json.dumps({"status": "ok", "room": room}).encode("utf-8"))
+                    else:
+                        self.wfile.write(json.dumps({"status": "error", "error": "ROOM_NOT_FOUND"}).encode("utf-8"))
             except Exception as e:
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
@@ -136,7 +152,7 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
             return
 
-        # WebRTC Signal: Send message (Offer / Answer / Candidate)
+        # WebRTC Signal & HTTP Relay: Send message (Offer / Answer / Candidate / Game packets)
         if parsed_path == "/api/signal/send":
             content_length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_length)
@@ -150,12 +166,13 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
 
-                if room in ROOMS:
-                    key = "host_msgs" if target == "host" else "guest_msgs"
-                    ROOMS[room][key].append(msg)
-                    self.wfile.write(b'{"status":"ok"}')
-                else:
-                    self.wfile.write(b'{"status":"error","error":"ROOM_NOT_FOUND"}')
+                with ROOMS_LOCK:
+                    if room in ROOMS:
+                        key = "host_msgs" if target == "host" else "guest_msgs"
+                        ROOMS[room][key].append(msg)
+                        self.wfile.write(b'{"status":"ok"}')
+                    else:
+                        self.wfile.write(b'{"status":"error","error":"ROOM_NOT_FOUND"}')
             except Exception as e:
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
@@ -219,12 +236,14 @@ class CustomHandler(http.server.SimpleHTTPRequestHandler):
         return super().do_GET()
 
 if __name__ == "__main__":
-    with socketserver.TCPServer(("", PORT), CustomHandler) as httpd:
+    http.server.ThreadingHTTPServer.daemon_threads = True
+    http.server.ThreadingHTTPServer.allow_reuse_address = True
+    with http.server.ThreadingHTTPServer(("", PORT), CustomHandler) as httpd:
         print(f"=================================================")
-        print(f" Peek-a-Boo Shooter Clone Server")
+        print(f" Peek-a-Boo Shooter Clone Server (Multi-Threaded)")
         print(f" Local URL:    http://localhost:{PORT}")
         print(f" Document Root: {BASE_DIR}")
-        print(f" WebRTC Signal: Active at /api/signal/*")
+        print(f" WebRTC & Relay: Active at /api/signal/*")
         print(f"=================================================")
         try:
             httpd.serve_forever()

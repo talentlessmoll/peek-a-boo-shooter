@@ -22,14 +22,15 @@ This repository contains a full static web build extended with **browser-to-brow
 
 ## ✨ Features
 
-### ⚔️ Real-Time P2P Multiplayer (100% Free Forever)
-* **Direct WebRTC DataChannels:** Game inputs and hit registrations travel directly between players' browsers with `<30ms` latency. No central game server relays inputs.
-* **4-Letter Room Codes:** Instant, memorable room codes (e.g. `BOO4`, `7K2X`) for easy sharing.
-* **1-Tap Invite Links:** Share a direct join link (`https://your-site.pages.dev/?room=BOO4`) to launch friends straight into the lobby.
-* **Match Formats:** Play Best of 5 (First to 3 wins), Best of 9, or Sudden Death duels.
-* **In-Game HUD & Latency Display:** Tracks series wins and displays real-time network latency (`Ping: XXms`).
-* **Floating Emoji Reactions:** Tap `🔥`, `😂`, `💀`, `🎯`, or `👏` to trigger floating animated pixel reactions on both screens.
-* **Host Authoritative Sync:** Automatic weapon roulette and distance synchronization across clients.
+### ⚔️ Real-Time Official Multiplayer (100% Free Forever)
+* **Official Matchmaking Integration:** Replicated directly from [1b2c-m.jazzuo.com](https://1b2c-m.jazzuo.com/) with zero backend maintenance costs ($0/mo).
+* **Two Play Modes:**
+  * **Play with a Friend:** Generates an instant shareable invite link (`?room=<id>`) and an interactive on-screen **QR Code**.
+  * **Play Random Opponent:** Global public matchmaking queue matching waiting duelist pairs.
+* **10-Second Ready Check:** Sound alert (880Hz chime) and mobile haptic vibration (`[200, 100, 200]`) on match found, with interactive countdown confirmation.
+* **Host-Authoritative 30 FPS Sync:** Host runs the physical duel simulation, synchronizing projectile trajectories, weapon roulette, and positions via normalized state packets.
+* **Smart Reconnection Recovery:** Token-based persistent sessions (`reconnectToken`) that automatically recover matches during network interruptions.
+* **Best-of-5 Duel Series:** Series scoring (first to 3 wins), round advancement, and one-tap rematch agreements.
 
 ### 🤖 Single-Player Mode
 * Play against a reaction-based AI bot with escalating difficulty and reflex challenges.

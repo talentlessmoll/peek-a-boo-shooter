@@ -1,0 +1,43 @@
+{
+  "id": "/",
+  "name": "1 Button 2 Colours",
+  "short_name": "1B2C",
+  "description": "A one-button multiplayer duel with a switchable single-player mode.",
+  "start_url": "/?mode=multiplayer",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "portrait",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "categories": ["games"],
+  "icons": [
+    {
+      "src": "/pwa-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "screenshots": [
+    {
+      "src": "/peekaboo-artwork.png",
+      "sizes": "507x379",
+      "type": "image/png",
+      "form_factor": "wide",
+      "label": "1 Button 2 Colours multiplayer duel"
+    }
+  ]
+}
